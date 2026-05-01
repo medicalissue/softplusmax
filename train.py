@@ -148,9 +148,9 @@ def infonce_diagnostics(z_a: torch.Tensor, z_b: torch.Tensor,
         s = s.masked_fill(mask_self, float("-inf"))
         gate = F.softmax(s, dim=-1)
     elif loss_kind == "sqjr":
-        # SqJumpReLU: cutoff on raw sim, τ amplifies magnitude only.
+        # Squared Jump Softplus: smooth sparse normalization on raw sim.
         th = float(theta) if theta is not None else 0.0
-        f = F.relu(sim - th).pow(2).masked_fill(mask_self, 0.0)
+        f = F.softplus(sim - th).pow(2).masked_fill(mask_self, 0.0)
         gate = f / f.sum(-1, keepdim=True).clamp_min(1e-30)
     else:  # sp
         s = sim / (tau or 1.0)
