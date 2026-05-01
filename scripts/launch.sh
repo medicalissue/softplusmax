@@ -12,10 +12,10 @@
 # REPO_URL / REPO_REF.
 set -euo pipefail
 
-VARIANT="${1:?variant required: sm or sp}"
+VARIANT="${1:?variant required: sm | sp | sp_kd_T4}"
 case "$VARIANT" in
-  sm|sp) ;;
-  *) echo "ERROR: variant must be 'sm' or 'sp'"; exit 2;;
+  sm|sp|sp_kd_T4) ;;
+  *) echo "ERROR: variant must be 'sm', 'sp', or 'sp_kd_T4'"; exit 2;;
 esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

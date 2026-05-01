@@ -79,19 +79,23 @@ class SoftmaxKD(nn.Module):
 
 
 class SoftplusmaxKD(nn.Module):
-    """KD where both teacher and student soft targets use softplusmax.
+    """KD with softplusmax(z/T) — direct mirror of softmax KD.
 
-    No temperature: softplusmax has built-in asymmetric softening
-    (linear in positive logit region, exp-like cutoff in negatives),
-    so the "T=4 oversoftening" hyperparameter is unnecessary.
+    For a fair comparison with softmax KD T=4, we apply the same z/T
+    scaling and × T² gradient correction. While ReLU's positive
+    homogeneity makes c·z a no-op in the strict ReLU limit, exact
+    softplus does respond to multiplicative scaling for c < 1
+    (transition zone widens, negatives lifted into the active region),
+    so z/T with T>1 is a meaningful softening dial.
 
-    L = α · NLL_softplusmax(student, label)
-      + (1-α) · KL(softplusmax(teacher) || softplusmax(student))
+        L = α · NLL_softplusmax(student, label)
+          + (1-α) · KL(softplusmax(teacher/T) || softplusmax(student/T)) · T²
     """
 
-    def __init__(self, alpha: float = 0.1, eps: float = 1e-8):
+    def __init__(self, alpha: float = 0.1, T: float = 1.0, eps: float = 1e-8):
         super().__init__()
         self.alpha = float(alpha)
+        self.T = float(T)
         self.eps = eps
 
     @staticmethod
@@ -111,14 +115,16 @@ class SoftplusmaxKD(nn.Module):
         teacher_logits: torch.Tensor,
         target: torch.Tensor,
     ) -> torch.Tensor:
+        T = self.T
+        # CE on raw student logits — student must learn label.
         ce = self._nll(student_logits, target)
-        # KL(P||Q) with P=teacher (detached), Q=student
-        p_t = self.softplusmax(teacher_logits.detach(), self.eps)
-        p_s = self.softplusmax(student_logits, self.eps)
-        # Σ p_t · (log p_t − log p_s), summed over classes, mean over batch
+        # KL on temperature-scaled distributions, with T² correction
+        # (mirrors Hinton softmax KD).
+        p_t = self.softplusmax(teacher_logits.detach() / T, self.eps)
+        p_s = self.softplusmax(student_logits / T, self.eps)
         kl = (p_t * (p_t.clamp_min(self.eps).log()
                      - p_s.clamp_min(self.eps).log())).sum(-1).mean()
-        return self.alpha * ce + (1.0 - self.alpha) * kl
+        return self.alpha * ce + (1.0 - self.alpha) * kl * (T * T)
 
 
 # ─── Stage C: InfoNCE / Contrastive ────────────────────────────────

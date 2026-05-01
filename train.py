@@ -249,7 +249,7 @@ def build_loss(args) -> nn.Module:
     if args.task == "kd":
         if args.loss == "sm":
             return SoftmaxKD(alpha=args.kd_alpha, T=args.T)
-        return SoftplusmaxKD(alpha=args.kd_alpha)
+        return SoftplusmaxKD(alpha=args.kd_alpha, T=args.T)
     if args.task == "infonce":
         if args.loss == "sm":
             return SoftmaxInfoNCE(tau=args.tau)
@@ -547,7 +547,9 @@ def get_args():
     p.add_argument("--weight_decay", type=float, default=5e-4)
 
     # kd
-    p.add_argument("--T", type=float, default=4.0, help="KD temperature (softmax only)")
+    p.add_argument("--T", type=float, default=4.0,
+                   help="KD temperature for both softmax KD (z/T) and "
+                        "softplusmax KD (also z/T, with × T² correction).")
     p.add_argument("--kd_alpha", type=float, default=0.1)
     p.add_argument("--teacher_ckpt", default=None)
 
@@ -579,11 +581,10 @@ def main():
     args = get_args()
     if args.out_dir is None:
         suffix = ""
-        if args.task == "kd" and args.loss == "sm":
+        if args.task == "kd":
             suffix = f"_T{args.T:g}"
         if args.task == "infonce" and args.loss == "sm":
             suffix = f"_tau{args.tau:g}"
-        # softplusmax has no T (kd) and no τ (infonce) by design.
         args.out_dir = f"runs/{args.task}_{args.loss}{suffix}"
     args.out_dir = Path(args.out_dir)
     args.out_dir.mkdir(parents=True, exist_ok=True)

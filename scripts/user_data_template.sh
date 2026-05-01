@@ -41,7 +41,7 @@ python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is
 pip install --quiet --upgrade tensorboard wandb || true
 
 # 4) Hand off to the variant runner.
-chmod +x scripts/run_sm.sh scripts/run_sp.sh
+chmod +x scripts/run_*.sh
 nohup bash scripts/run_@@VARIANT@@.sh > /var/log/runner.log 2>&1 || true
 echo "[user-data] runner exited rc=$?"
 
