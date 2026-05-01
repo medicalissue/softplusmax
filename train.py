@@ -148,9 +148,9 @@ def infonce_diagnostics(z_a: torch.Tensor, z_b: torch.Tensor,
         s = s.masked_fill(mask_self, float("-inf"))
         gate = F.softmax(s, dim=-1)
     elif loss_kind == "sqjr":
-        s = sim / (tau or 1.0)
+        # SqJumpReLU: cutoff on raw sim, τ amplifies magnitude only.
         th = float(theta) if theta is not None else 0.0
-        f = F.relu(s - th).pow(2).masked_fill(mask_self, 0.0)
+        f = F.relu(sim - th).pow(2).masked_fill(mask_self, 0.0)
         gate = f / f.sum(-1, keepdim=True).clamp_min(1e-30)
     else:  # sp
         s = sim / (tau or 1.0)
@@ -307,7 +307,6 @@ def build_loss(args) -> nn.Module:
             return SoftmaxInfoNCE(tau=args.tau)
         if args.loss == "sqjr":
             return SqJumpReLUInfoNCE(
-                tau=args.tau,
                 theta_init=args.sqjr_theta_init,
                 learnable=args.sqjr_theta_learnable,
             )
@@ -659,10 +658,11 @@ def main():
         if args.task == "kd":
             suffix = f"_T{args.T:g}"
         if args.task == "infonce":
-            suffix = f"_tau{args.tau:g}"
             if args.loss == "sqjr":
                 lr = "L" if args.sqjr_theta_learnable else "F"
-                suffix += f"_th{args.sqjr_theta_init:g}{lr}"
+                suffix = f"_th{args.sqjr_theta_init:g}{lr}"
+            else:
+                suffix = f"_tau{args.tau:g}"
         args.out_dir = f"runs/{args.task}_{args.loss}{suffix}"
     args.out_dir = Path(args.out_dir)
     args.out_dir.mkdir(parents=True, exist_ok=True)
