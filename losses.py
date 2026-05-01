@@ -201,41 +201,33 @@ class SqJumpReLUInfoNCE(nn.Module):
         f(x)  = softplus(x − θ)^2 = log²(1 + exp(x − θ))
         p_i   = f(s_ij) / Σ_k f(s_ik)
 
-    Same family as SqJumpReLU but with softplus instead of ReLU:
-        SqJumpReLU      :  [x − θ]_+^2          (C¹, dies at x ≤ θ)
-        SqJumpSoftplus  :  softplus(x − θ)^2    (C^∞, never zero)
+    Same family as SqJumpReLU but with softplus instead of ReLU. Hard
+    ReLU cutoff has a fatal failure mode: a sample whose positive
+    similarity falls at or below θ has f(s_pos) = 0, log(0) = −∞, and
+    both embedding and θ gradients vanish — the sample becomes dead and
+    cannot recover. Replacing ReLU with softplus gives quadratic
+    amplification for x ≫ θ and exponential decay for x ≪ θ while
+    keeping f strictly positive everywhere; gradients always flow.
 
-    Why softplus: with hard ReLU cutoff, any sample whose positive
-    similarity falls at or below θ has f = 0 → log(0) = −∞ → its
-    embedding and θ gradients are both zero, so the sample becomes
-    permanently dead. Replacing ReLU with softplus gives the same
-    quadratic amplification for x ≫ θ and exponential decay for x ≪ θ
-    while keeping f strictly positive everywhere — gradients always
-    flow, no dead samples.
+    Because softplus removes the dead-sample failure mode, θ does not
+    need to be bounded — there is no scenario where an unbounded θ
+    causes catastrophic failure (only slow learning at extremes, which
+    the loss self-corrects). θ is a plain unconstrained nn.Parameter,
+    learned end-to-end with no STE and no reparameterization.
 
-    similarities live in [-1, 1] (L2-normalized). θ is parameterized as
-    tanh(theta_raw) so the cutoff sits in (-1, 1). theta_raw is an
-    unconstrained nn.Parameter, learned end-to-end (no STE).
-
-    No τ: scale-invariant under positive multiplicative rescaling of f,
-    so a temperature would be a no-op. The only knob is θ.
+    No τ: the loss is scale-invariant under positive multiplicative
+    rescaling of f, so a temperature would be a no-op. θ is the only
+    knob.
     """
 
     def __init__(self, theta_init: float = 0.0, learnable: bool = True,
                  eps: float = 1e-8):
         super().__init__()
         self.eps = eps
-        if abs(theta_init) >= 1.0:
-            raise ValueError("theta_init must be in (-1, 1)")
-        raw_init = math.atanh(theta_init)
         if learnable:
-            self.theta_raw = nn.Parameter(torch.tensor(float(raw_init)))
+            self.theta = nn.Parameter(torch.tensor(float(theta_init)))
         else:
-            self.register_buffer("theta_raw", torch.tensor(float(raw_init)))
-
-    @property
-    def theta(self) -> torch.Tensor:
-        return torch.tanh(self.theta_raw)
+            self.register_buffer("theta", torch.tensor(float(theta_init)))
 
     def forward(self, z_a: torch.Tensor, z_b: torch.Tensor) -> torch.Tensor:
         B = z_a.size(0)
