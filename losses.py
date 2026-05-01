@@ -161,27 +161,27 @@ class SoftmaxInfoNCE(nn.Module):
 
 
 class SoftplusmaxInfoNCE(nn.Module):
-    """Softplusmax InfoNCE — no temperature.
+    """Softplusmax InfoNCE — direct mirror of softmax InfoNCE with τ.
 
-    The whole point of softplusmax is that the asymmetric sharpening
-    is built into the function (exp-like for negatives, linear for
-    positives), so the temperature hyperparameter that softmax-InfoNCE
-    needs (e.g. SimCLR CIFAR τ=0.5, ImageNet τ=0.1) is absorbed.
+    For a fair comparison with softmax InfoNCE, we apply the same s/τ
+    scaling so the only difference is the function (exp vs softplus):
 
-        p_i = softplus(s_i) / Σ_{j≠i} softplus(s_j)
-        L_i = -log p_{positive}
+        sm:  p_i = exp(s_ij/τ)      / Σ exp(s_ik/τ)
+        sp:  p_i = softplus(s_ij/τ) / Σ softplus(s_ik/τ)
 
-    Similarities s_ij = z_i · z_j with z's L2-normalized are in [-1, 1].
+    With L2-normalized embeddings, s ∈ [-1, 1]; dividing by τ stretches
+    similarities into the active region of the chosen function.
     """
 
-    def __init__(self, eps: float = 1e-8):
+    def __init__(self, tau: float = 0.5, eps: float = 1e-8):
         super().__init__()
+        self.tau = float(tau)
         self.eps = eps
 
     def forward(self, z_a: torch.Tensor, z_b: torch.Tensor) -> torch.Tensor:
         B = z_a.size(0)
         z = torch.cat([z_a, z_b], dim=0)                # [2B, D]
-        sim = z @ z.t()                                  # [2B, 2B]   (no τ)
+        sim = z @ z.t() / self.tau                       # [2B, 2B]
         mask_self = torch.eye(2 * B, dtype=torch.bool, device=z.device)
         sp = F.softplus(sim)                             # [2B, 2B]
         sp = sp.masked_fill(mask_self, 0.0)

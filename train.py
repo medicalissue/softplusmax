@@ -253,8 +253,7 @@ def build_loss(args) -> nn.Module:
     if args.task == "infonce":
         if args.loss == "sm":
             return SoftmaxInfoNCE(tau=args.tau)
-        # Softplusmax has no temperature — the whole point. Ignore --tau.
-        return SoftplusmaxInfoNCE()
+        return SoftplusmaxInfoNCE(tau=args.tau)
     raise ValueError(args.task)
 
 
@@ -583,7 +582,7 @@ def main():
         suffix = ""
         if args.task == "kd":
             suffix = f"_T{args.T:g}"
-        if args.task == "infonce" and args.loss == "sm":
+        if args.task == "infonce":
             suffix = f"_tau{args.tau:g}"
         args.out_dir = f"runs/{args.task}_{args.loss}{suffix}"
     args.out_dir = Path(args.out_dir)
