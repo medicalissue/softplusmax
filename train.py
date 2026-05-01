@@ -272,7 +272,7 @@ def build_teacher(args, num_classes: int = 100) -> nn.Module:
 
 # ─── Eval ──────────────────────────────────────────────────────────
 @torch.no_grad()
-def eval_full(model, loader, device, loss_kind: str):
+def eval_full(model, loader, device, loss_kind: str, autocast_dtype=None):
     """Returns top-1, top-5, ECE for the full validation set.
 
     loss_kind: "sm" → ECE under softmax probs
@@ -281,12 +281,19 @@ def eval_full(model, loader, device, loss_kind: str):
     model.eval()
     n_correct1 = n_correct5 = n_total = 0
     all_probs, all_targets = [], []
+    use_amp = autocast_dtype is not None and device.type == "cuda"
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-        logits = model(x)
+        if use_amp:
+            with torch.amp.autocast("cuda", dtype=autocast_dtype):
+                logits = model(x)
+        else:
+            logits = model(x)
         if isinstance(logits, tuple):
             logits = logits[0]
+        # Cast back to fp32 for stable softmax/softplusmax + calibration.
+        logits = logits.float()
         n_correct1 += (logits.argmax(-1) == y).sum().item()
         n_correct5 += topk_correct(logits, y, k=5)
         n_total += y.numel()
@@ -324,6 +331,18 @@ def train_cls_or_kd(args):
     sched_cos = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=args.epochs - args.warmup_epochs, eta_min=args.min_lr)
 
+    # bf16 + torch.compile (CUDA only). bf16 has full fp32 dynamic range, so
+    # we don't need a GradScaler. Compile is "default" mode — short warm-up
+    # and ~1.5-2× steady-state speedup on L4 / H100 for ResNet-CIFAR.
+    use_amp = args.amp and device.type == "cuda"
+    autocast_dtype = torch.bfloat16 if use_amp else None
+    raw_model = model  # keep handle to the un-compiled module for state_dict
+    if args.compile and device.type == "cuda":
+        print(f"[compile] torch.compile(mode='{args.compile_mode}')")
+        model = torch.compile(model, mode=args.compile_mode)
+        if teacher is not None:
+            teacher = torch.compile(teacher, mode=args.compile_mode)
+
     best_acc = 0.0
     last_logits = None  # for diagnostics
 
@@ -343,15 +362,27 @@ def train_cls_or_kd(args):
         for x, y in tl:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            logits = model(x)
-            if isinstance(logits, tuple):
-                logits = logits[0]
-            if teacher is not None:
-                with torch.no_grad():
-                    t_logits = teacher(x)
-                loss = loss_fn(logits, t_logits, y)
+            if use_amp:
+                with torch.amp.autocast("cuda", dtype=autocast_dtype):
+                    logits = model(x)
+                    if isinstance(logits, tuple):
+                        logits = logits[0]
+                    if teacher is not None:
+                        with torch.no_grad():
+                            t_logits = teacher(x)
+                        loss = loss_fn(logits, t_logits, y)
+                    else:
+                        loss = loss_fn(logits, y)
             else:
-                loss = loss_fn(logits, y)
+                logits = model(x)
+                if isinstance(logits, tuple):
+                    logits = logits[0]
+                if teacher is not None:
+                    with torch.no_grad():
+                        t_logits = teacher(x)
+                    loss = loss_fn(logits, t_logits, y)
+                else:
+                    loss = loss_fn(logits, y)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gn_running += grad_norm(model)
@@ -360,7 +391,7 @@ def train_cls_or_kd(args):
             running += loss.item() * y.size(0)
             n += y.size(0)
             train_correct += (logits.detach().argmax(-1) == y).sum().item()
-            last_logits = logits.detach()
+            last_logits = logits.detach().float()
         if epoch >= args.warmup_epochs:
             sched_cos.step()
         train_loss = running / max(n, 1)
@@ -369,11 +400,12 @@ def train_cls_or_kd(args):
         elapsed = time.time() - t0
 
         # Validation: top-1, top-5, ECE (under the model's own probability head).
-        ev = eval_full(model, vl, device, loss_kind=args.loss)
+        ev = eval_full(model, vl, device, loss_kind=args.loss,
+                       autocast_dtype=autocast_dtype)
         is_best = ev["top1"] > best_acc
         if is_best:
             best_acc = ev["top1"]
-            torch.save({"model": model.state_dict(), "epoch": epoch,
+            torch.save({"model": raw_model.state_dict(), "epoch": epoch,
                         "acc": ev["top1"]}, args.out_dir / "best.pt")
         cur_lr = opt.param_groups[0]["lr"]
 
@@ -395,7 +427,7 @@ def train_cls_or_kd(args):
         if args.wandb:
             wandb.log(log_dict, step=epoch)
 
-    torch.save({"model": model.state_dict(), "epoch": args.epochs - 1,
+    torch.save({"model": raw_model.state_dict(), "epoch": args.epochs - 1,
                 "acc": ev["top1"]}, args.out_dir / "last.pt")
     if args.wandb:
         wandb.summary["best_top1"] = best_acc
@@ -421,6 +453,13 @@ def train_infonce(args):
     sched_cos = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=args.epochs - args.warmup_epochs, eta_min=args.min_lr)
 
+    use_amp = args.amp and device.type == "cuda"
+    autocast_dtype = torch.bfloat16 if use_amp else None
+    raw_model = model
+    if args.compile and device.type == "cuda":
+        print(f"[compile] torch.compile(mode='{args.compile_mode}')")
+        model = torch.compile(model, mode=args.compile_mode)
+
     for epoch in range(args.epochs):
         model.train()
         if epoch < args.warmup_epochs:
@@ -437,9 +476,15 @@ def train_infonce(args):
         for (xa, xb), _ in tl:
             xa = xa.to(device, non_blocking=True)
             xb = xb.to(device, non_blocking=True)
-            za = model(xa)
-            zb = model(xb)
-            loss = loss_fn(za, zb)
+            if use_amp:
+                with torch.amp.autocast("cuda", dtype=autocast_dtype):
+                    za = model(xa)
+                    zb = model(xb)
+                    loss = loss_fn(za, zb)
+            else:
+                za = model(xa)
+                zb = model(xb)
+                loss = loss_fn(za, zb)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gn_running += grad_norm(model)
@@ -447,7 +492,7 @@ def train_infonce(args):
             opt.step()
             running += loss.item() * xa.size(0)
             n += xa.size(0)
-            last_za, last_zb = za.detach(), zb.detach()
+            last_za, last_zb = za.detach().float(), zb.detach().float()
         if epoch >= args.warmup_epochs:
             sched_cos.step()
         train_loss = running / max(n, 1)
@@ -473,9 +518,9 @@ def train_infonce(args):
             wandb.log(log_dict, step=epoch)
 
         if (epoch + 1) % 50 == 0 or epoch == args.epochs - 1:
-            torch.save({"model": model.state_dict(), "epoch": epoch},
+            torch.save({"model": raw_model.state_dict(), "epoch": epoch},
                        args.out_dir / f"ckpt_{epoch+1:04d}.pt")
-    torch.save({"model": model.state_dict(), "epoch": args.epochs - 1},
+    torch.save({"model": raw_model.state_dict(), "epoch": args.epochs - 1},
                args.out_dir / "last.pt")
     print("\nDone. Run eval.py with --backbone for linear eval.")
     return None
@@ -517,6 +562,16 @@ def get_args():
     p.add_argument("--wandb_entity", default=None)
     p.add_argument("--wandb_run_name", default=None,
                    help="Default: derived from --task / --loss / --T / --tau / --seed")
+
+    # AMP + compile (default ON; pass --no-amp / --no-compile to disable)
+    p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True,
+                   help="Use bf16 autocast on CUDA (full fp32 dynamic range, "
+                        "no GradScaler needed). Default: on.")
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                   help="Wrap model with torch.compile after model build. "
+                        "Default: on.")
+    p.add_argument("--compile_mode", choices=["default", "reduce-overhead", "max-autotune"],
+                   default="default")
     return p.parse_args()
 
 

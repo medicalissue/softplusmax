@@ -84,6 +84,9 @@ def main():
                    help="log to W&B (requires WANDB_API_KEY)")
     p.add_argument("--wandb_project", default="softplusmax")
     p.add_argument("--wandb_entity", default=None)
+    p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--compile_mode", default="default")
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -112,6 +115,11 @@ def main():
     opt = torch.optim.SGD(head.parameters(), lr=args.lr, momentum=0.9, weight_decay=0.0)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
+    use_amp = args.amp and device.type == "cuda"
+    autocast_dtype = torch.bfloat16 if use_amp else None
+    if args.compile and device.type == "cuda":
+        backbone = torch.compile(backbone, mode=args.compile_mode)
+
     best = 0.0
     for ep in range(args.epochs):
         backbone.eval()
@@ -122,7 +130,12 @@ def main():
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             with torch.no_grad():
-                _, feats = backbone(x)
+                if use_amp:
+                    with torch.amp.autocast("cuda", dtype=autocast_dtype):
+                        _, feats = backbone(x)
+                    feats = feats.float()
+                else:
+                    _, feats = backbone(x)
             logits = head(feats)
             loss = F.cross_entropy(logits, y)
             opt.zero_grad(set_to_none=True)
@@ -138,7 +151,12 @@ def main():
             for x, y in vl:
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
-                _, feats = backbone(x)
+                if use_amp:
+                    with torch.amp.autocast("cuda", dtype=autocast_dtype):
+                        _, feats = backbone(x)
+                    feats = feats.float()
+                else:
+                    _, feats = backbone(x)
                 pred = head(feats).argmax(-1)
                 n_c += (pred == y).sum().item()
                 n_t += y.numel()
