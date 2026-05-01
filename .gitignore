@@ -1,0 +1,20 @@
+# Local secrets
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local artifacts
+runs/
+data/
+wandb/
+*.pth
+*.pt
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/

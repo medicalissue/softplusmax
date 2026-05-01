@@ -1,0 +1,217 @@
+"""Softmax vs Softplusmax losses for classification, distillation, and InfoNCE.
+
+All "softplusmax" variants replace exp with softplus in the
+normalization step:
+
+    softmax(z)_i      = exp(z_i)      / Σ_j exp(z_j)
+    softplusmax(z)_i  = softplus(z_i) / Σ_j softplus(z_j)
+
+Softplus is asymmetric — exp-like for z<<0, linear for z>>0 — which
+gives a per-class consideration gate σ(z) = ζ'(z) on top of L1
+normalization. See proposal for full derivation.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ─── Stage A: Classification ────────────────────────────────────────
+class SoftmaxCE(nn.Module):
+    """Standard cross-entropy: -log softmax(logits)[label]."""
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(logits, target)
+
+
+class SoftplusmaxCE(nn.Module):
+    """Cross-entropy on softplusmax (drop-in for SoftmaxCE).
+
+    Both losses minimize -log p[y]; the only difference is the
+    normalization that produces p:
+        SoftmaxCE     :  p = softmax(logits)     = exp(z) / Σ exp(z)
+        SoftplusmaxCE :  p = softplusmax(logits) = ζ(z)   / Σ ζ(z)
+                         where ζ(z) = log(1 + e^z) = softplus(z)
+
+    F.cross_entropy is hard-coded to softmax, so we compute the
+    softplusmax variant explicitly.
+    """
+
+    def __init__(self, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        sp = F.softplus(logits)                                    # [B, C]
+        denom = sp.sum(-1, keepdim=True).clamp_min(self.eps)        # [B, 1]
+        log_p = sp.gather(-1, target.unsqueeze(-1)).log() - denom.log()
+        return -log_p.mean()
+
+
+# ─── Stage B: Knowledge Distillation ───────────────────────────────
+class SoftmaxKD(nn.Module):
+    """Hinton-style KD with softmax(z/T) on both teacher and student.
+
+    L = α · CE(student, label)
+      + (1-α) · KL(softmax(teacher/T) || softmax(student/T)) · T²
+    """
+
+    def __init__(self, alpha: float = 0.1, T: float = 4.0):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.T = float(T)
+
+    def forward(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        T = self.T
+        ce = F.cross_entropy(student_logits, target)
+        # log_softmax for student, softmax for teacher (KL standard form).
+        log_s = F.log_softmax(student_logits / T, dim=-1)
+        soft_t = F.softmax(teacher_logits / T, dim=-1)
+        # KL(P||Q) = Σ P · (log P − log Q); here P=teacher (no grad), Q=student.
+        kl = F.kl_div(log_s, soft_t, reduction="batchmean") * (T * T)
+        return self.alpha * ce + (1.0 - self.alpha) * kl
+
+
+class SoftplusmaxKD(nn.Module):
+    """KD where both teacher and student soft targets use softplusmax.
+
+    No temperature: softplusmax has built-in asymmetric softening
+    (linear in positive logit region, exp-like cutoff in negatives),
+    so the "T=4 oversoftening" hyperparameter is unnecessary.
+
+    L = α · NLL_softplusmax(student, label)
+      + (1-α) · KL(softplusmax(teacher) || softplusmax(student))
+    """
+
+    def __init__(self, alpha: float = 0.1, eps: float = 1e-8):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.eps = eps
+
+    @staticmethod
+    def softplusmax(z: torch.Tensor, eps: float) -> torch.Tensor:
+        sp = F.softplus(z)
+        return sp / sp.sum(-1, keepdim=True).clamp_min(eps)
+
+    def _nll(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        sp = F.softplus(logits)
+        denom = sp.sum(-1, keepdim=True).clamp_min(self.eps)
+        log_p = sp.gather(-1, target.unsqueeze(-1)).log() - denom.log()
+        return -log_p.mean()
+
+    def forward(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        ce = self._nll(student_logits, target)
+        # KL(P||Q) with P=teacher (detached), Q=student
+        p_t = self.softplusmax(teacher_logits.detach(), self.eps)
+        p_s = self.softplusmax(student_logits, self.eps)
+        # Σ p_t · (log p_t − log p_s), summed over classes, mean over batch
+        kl = (p_t * (p_t.clamp_min(self.eps).log()
+                     - p_s.clamp_min(self.eps).log())).sum(-1).mean()
+        return self.alpha * ce + (1.0 - self.alpha) * kl
+
+
+# ─── Stage C: InfoNCE / Contrastive ────────────────────────────────
+class SoftmaxInfoNCE(nn.Module):
+    """Standard SimCLR-style InfoNCE.
+
+    For each anchor in the batch, the positive is its augmented partner;
+    negatives are the other 2(B-1) views in the batch. We compute
+    similarities z_i · z_j / τ and use softmax cross-entropy.
+    """
+
+    def __init__(self, tau: float = 0.1):
+        super().__init__()
+        self.tau = float(tau)
+
+    def forward(
+        self,
+        z_a: torch.Tensor,            # [B, D]  anchor embeddings (l2-normalized)
+        z_b: torch.Tensor,            # [B, D]  paired view embeddings
+    ) -> torch.Tensor:
+        B = z_a.size(0)
+        # Concatenate both views, treat as 2B samples; positives are
+        # off-diagonal pairs (i, i+B) and (i+B, i).
+        z = torch.cat([z_a, z_b], dim=0)                # [2B, D]
+        sim = z @ z.t() / self.tau                       # [2B, 2B]
+        # Mask self-similarity.
+        mask_self = torch.eye(2 * B, dtype=torch.bool, device=z.device)
+        sim.masked_fill_(mask_self, float("-inf"))
+        # Positive index: for row i (0..B-1), positive is i+B; for row
+        # i (B..2B-1), positive is i-B.
+        pos_idx = torch.arange(2 * B, device=z.device)
+        pos_idx = (pos_idx + B) % (2 * B)
+        return F.cross_entropy(sim, pos_idx)
+
+
+class SoftplusmaxInfoNCE(nn.Module):
+    """Softplusmax InfoNCE — no temperature.
+
+    The whole point of softplusmax is that the asymmetric sharpening
+    is built into the function (exp-like for negatives, linear for
+    positives), so the temperature hyperparameter that softmax-InfoNCE
+    needs (e.g. SimCLR CIFAR τ=0.5, ImageNet τ=0.1) is absorbed.
+
+        p_i = softplus(s_i) / Σ_{j≠i} softplus(s_j)
+        L_i = -log p_{positive}
+
+    Similarities s_ij = z_i · z_j with z's L2-normalized are in [-1, 1].
+    """
+
+    def __init__(self, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, z_a: torch.Tensor, z_b: torch.Tensor) -> torch.Tensor:
+        B = z_a.size(0)
+        z = torch.cat([z_a, z_b], dim=0)                # [2B, D]
+        sim = z @ z.t()                                  # [2B, 2B]   (no τ)
+        mask_self = torch.eye(2 * B, dtype=torch.bool, device=z.device)
+        sp = F.softplus(sim)                             # [2B, 2B]
+        sp = sp.masked_fill(mask_self, 0.0)
+        denom = sp.sum(-1, keepdim=True).clamp_min(self.eps)
+        pos_idx = torch.arange(2 * B, device=z.device)
+        pos_idx = (pos_idx + B) % (2 * B)
+        sp_pos = sp.gather(-1, pos_idx.unsqueeze(-1)).squeeze(-1)
+        log_p = sp_pos.clamp_min(self.eps).log() - denom.squeeze(-1).log()
+        return -log_p.mean()
+
+
+# ─── Sanity / smoke test ───────────────────────────────────────────
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    B, C, D = 8, 100, 128
+
+    # classification
+    logits = torch.randn(B, C, requires_grad=True)
+    target = torch.randint(0, C, (B,))
+    print("SoftmaxCE     :", SoftmaxCE()(logits, target).item())
+    print("SoftplusmaxCE:", SoftplusmaxCE()(logits, target).item())
+
+    # distillation
+    s_logits = torch.randn(B, C, requires_grad=True)
+    t_logits = torch.randn(B, C)
+    print("SoftmaxKD     :", SoftmaxKD()(s_logits, t_logits, target).item())
+    print("SoftplusmaxKD :", SoftplusmaxKD()(s_logits, t_logits, target).item())
+
+    # InfoNCE
+    z_a = F.normalize(torch.randn(B, D), dim=-1).requires_grad_(True)
+    z_b = F.normalize(torch.randn(B, D), dim=-1)
+    print("SoftmaxNCE    :", SoftmaxInfoNCE(tau=0.5)(z_a, z_b).item())
+    print("SoftplusmaxNCE:", SoftplusmaxInfoNCE()(z_a, z_b).item())
+
+    # backward sanity
+    SoftplusmaxCE()(logits, target).backward()
+    SoftplusmaxKD()(s_logits, t_logits, target).backward()
+    SoftplusmaxInfoNCE()(z_a, z_b).backward()
+    print("backward OK")
