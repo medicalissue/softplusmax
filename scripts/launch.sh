@@ -12,9 +12,9 @@
 # REPO_URL / REPO_REF.
 set -euo pipefail
 
-VARIANT="${1:?variant required: sm | sp | sp_kd_T4 | sp_infonce}"
+VARIANT="${1:?variant required: sm | sp | sp_kd_T4 | sp_infonce | sqjr_infonce}"
 case "$VARIANT" in
-  sm|sp|sp_kd_T4|sp_infonce) ;;
+  sm|sp|sp_kd_T4|sp_infonce|sqjr_infonce) ;;
   *) echo "ERROR: invalid variant '$VARIANT'"; exit 2;;
 esac
 

@@ -193,6 +193,52 @@ class SoftplusmaxInfoNCE(nn.Module):
         return -log_p.mean()
 
 
+class SqJumpReLUInfoNCE(nn.Module):
+    """Squared JumpReLU InfoNCE: sparse contrastive normalization.
+
+        f(x) = [x − θ]_+^2          (C¹-smooth, no STE needed)
+        p_i  = f(s_ij/τ) / Σ_k f(s_ik/τ)
+
+    Two parameters:
+      - τ: temperature (typically 1.0; θ-learnable absorbs τ)
+      - θ: cutoff threshold. If `learnable=True`, θ is an nn.Parameter
+        trained jointly with the backbone. Initialized at 0 (= squared
+        ReLU). The squared form makes θ end-to-end differentiable
+        without straight-through gradients (unlike vanilla JumpReLU).
+
+    Sparse by construction: any sim < θ produces zero gate, giving
+    automatic hard-negative cutoff. Inspired by JumpReLU SAE
+    (Rajamanoharan et al. 2024) but C¹-smooth.
+    """
+
+    def __init__(self, tau: float = 1.0, theta_init: float = 0.0,
+                 learnable: bool = True, eps: float = 1e-8):
+        super().__init__()
+        self.tau = float(tau)
+        self.eps = eps
+        if learnable:
+            self.theta = nn.Parameter(torch.tensor(float(theta_init)))
+        else:
+            self.register_buffer("theta", torch.tensor(float(theta_init)))
+
+    def forward(self, z_a: torch.Tensor, z_b: torch.Tensor) -> torch.Tensor:
+        B = z_a.size(0)
+        z = torch.cat([z_a, z_b], dim=0)                # [2B, D]
+        sim = z @ z.t() / self.tau                       # [2B, 2B]
+        mask_self = torch.eye(2 * B, dtype=torch.bool, device=z.device)
+        # Squared JumpReLU on the similarities.
+        f = F.relu(sim - self.theta).pow(2)              # [2B, 2B]
+        f = f.masked_fill(mask_self, 0.0)
+        denom = f.sum(-1, keepdim=True).clamp_min(self.eps)
+        pos_idx = torch.arange(2 * B, device=z.device)
+        pos_idx = (pos_idx + B) % (2 * B)
+        f_pos = f.gather(-1, pos_idx.unsqueeze(-1)).squeeze(-1)
+        # Use clamp_min on the positive value so log doesn't explode if
+        # θ ever moves above the positive similarity.
+        log_p = f_pos.clamp_min(self.eps).log() - denom.squeeze(-1).log()
+        return -log_p.mean()
+
+
 # ─── Sanity / smoke test ───────────────────────────────────────────
 if __name__ == "__main__":
     torch.manual_seed(0)

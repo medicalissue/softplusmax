@@ -44,7 +44,7 @@ from models.proj_head import ProjectionHead, BackboneWithHead
 from losses import (
     SoftmaxCE, SoftplusmaxCE,
     SoftmaxKD, SoftplusmaxKD,
-    SoftmaxInfoNCE, SoftplusmaxInfoNCE,
+    SoftmaxInfoNCE, SoftplusmaxInfoNCE, SqJumpReLUInfoNCE,
 )
 
 # wandb is optional; only import if --wandb is set.
@@ -118,15 +118,23 @@ def topk_correct(logits: torch.Tensor, target: torch.Tensor, k: int = 5) -> int:
 
 @torch.no_grad()
 def infonce_diagnostics(z_a: torch.Tensor, z_b: torch.Tensor,
-                         loss_kind: str, tau: float | None = None) -> dict:
-    """Snapshot the gate distribution for one batch, for sm or sp.
+                         loss_kind: str, tau: float | None = None,
+                         theta: float | None = None) -> dict:
+    """Snapshot the gate distribution for one batch.
+
+    Supported loss_kind:
+      "sm"   — softmax(sim/τ)
+      "sp"   — softplus(sim/τ) / Σ
+      "sqjr" — [sim - θ]_+^2 / Σ  (Squared JumpReLU; θ may be learnable)
 
     Returns:
-      pos_gate_share — mean gate mass on the positive pair (out of 1.0)
-      gate_entropy   — Shannon entropy of the per-row gate distribution
-                       (normalized by log(2B-1) so it lies in [0, 1])
-      pos_sim        — mean positive similarity in the batch
-      neg_sim_top10  — mean of top-10% hardest negative similarities
+      pos_gate_share, gate_entropy, pos_sim, neg_sim_top10  (existing)
+      n_active        — mean #classes with nonzero gate (per row)
+      n_cutoff        — mean #negatives that are exactly cut off
+      hard_easy_ratio — mean(gate on hard negs) / mean(gate on easy negs)
+      effective_k     — exp(entropy) over the negative-only distribution
+      pos_neg_gap     — pos_sim − mean(top-10% neg sim)
+      theta_value     — current theta (if applicable, else 0)
     """
     B = z_a.size(0)
     z = torch.cat([z_a, z_b], dim=0)            # [2B, D]
@@ -138,31 +146,75 @@ def infonce_diagnostics(z_a: torch.Tensor, z_b: torch.Tensor,
     if loss_kind == "sm":
         s = sim / (tau or 1.0)
         s = s.masked_fill(mask_self, float("-inf"))
-        gate = F.softmax(s, dim=-1)              # [2B, 2B]
-    else:
-        s = sim                                   # softplusmax has no τ
+        gate = F.softmax(s, dim=-1)
+    elif loss_kind == "sqjr":
+        s = sim / (tau or 1.0)
+        th = float(theta) if theta is not None else 0.0
+        f = F.relu(s - th).pow(2).masked_fill(mask_self, 0.0)
+        gate = f / f.sum(-1, keepdim=True).clamp_min(1e-30)
+    else:  # sp
+        s = sim / (tau or 1.0)
         sp = F.softplus(s).masked_fill(mask_self, 0.0)
         gate = sp / sp.sum(-1, keepdim=True).clamp_min(1e-8)
 
     pos_gate = gate.gather(-1, pos_idx.unsqueeze(-1)).squeeze(-1)  # [2B]
-    # Entropy normalized by log(N-1) where N = 2B (one self masked out).
+    # Entropy normalized by log(N-1).
     g_eps = gate.clamp_min(1e-12)
-    entropy = -(gate * g_eps.log()).sum(-1)                        # [2B]
+    entropy = -(gate * g_eps.log()).sum(-1)
     norm_entropy = entropy / math.log(2 * B - 1)
 
-    # Negative similarities: rows × cols excluding self and the positive.
+    # Negative-only mask.
     pos_mask = torch.zeros_like(sim, dtype=torch.bool)
     pos_mask.scatter_(-1, pos_idx.unsqueeze(-1), True)
     neg_mask = ~(mask_self | pos_mask)
     neg_sims = sim[neg_mask].view(2 * B, -1)
     k_top = max(1, neg_sims.size(-1) // 10)
-    top_neg = neg_sims.topk(k_top, dim=-1).values.mean()
+    top_neg_sim = neg_sims.topk(k_top, dim=-1).values.mean()
+    pos_sim_mean = sim.gather(-1, pos_idx.unsqueeze(-1)).squeeze(-1).mean()
+
+    # Sparsity / cutoff stats (meaningful for sp/sqjr).
+    n_active = (gate > 0).sum(-1).float().mean()
+    # n_cutoff: negatives with exactly zero gate.
+    neg_gate = gate.masked_fill(~neg_mask, 1.0)  # nonzero filler so we don't count pos/self
+    n_cutoff = (neg_gate == 0).sum(-1).float().mean()
+
+    # Hard vs easy negatives by similarity quartile.
+    sim_d = sim.detach()
+    # Per-row top-25% as hard, bottom-50% as easy (excluding self/pos).
+    neg_sims_only = sim_d.masked_fill(~neg_mask, float("-inf"))
+    n_neg = neg_mask.sum(-1).clamp_min(1)  # 2B-2
+    k_hard = (n_neg.float() * 0.25).long().clamp_min(1)
+    k_easy = (n_neg.float() * 0.50).long().clamp_min(1)
+    # Hard threshold per row.
+    hard_thresh = neg_sims_only.topk(k_hard.max().item(), dim=-1).values[:, -1:]
+    easy_thresh = (-neg_sims_only).topk(k_easy.max().item(), dim=-1).values[:, -1:]
+    easy_thresh = -easy_thresh  # values below this = easy
+    hard_mask = neg_mask & (sim_d >= hard_thresh)
+    easy_mask = neg_mask & (sim_d <= easy_thresh)
+    n_hard = hard_mask.sum(-1).float().clamp_min(1)
+    n_easy = easy_mask.sum(-1).float().clamp_min(1)
+    mass_hard = (gate * hard_mask).sum(-1) / n_hard
+    mass_easy = (gate * easy_mask).sum(-1) / n_easy
+    hard_easy_ratio = (mass_hard.mean() / mass_easy.mean().clamp_min(1e-12))
+
+    # Effective k over the *negative-only* distribution (renormalized).
+    neg_gate_mass = (gate * neg_mask).sum(-1, keepdim=True).clamp_min(1e-30)
+    p_neg = (gate * neg_mask) / neg_gate_mass
+    p_neg_eps = p_neg.clamp_min(1e-12)
+    H_neg = -(p_neg * p_neg_eps.log()).sum(-1)
+    eff_k = H_neg.exp().mean()
 
     return {
-        "pos_gate_share": pos_gate.mean().item(),
-        "gate_entropy":   norm_entropy.mean().item(),
-        "pos_sim":        sim.gather(-1, pos_idx.unsqueeze(-1)).mean().item(),
-        "neg_sim_top10":  top_neg.item(),
+        "pos_gate_share":    pos_gate.mean().item(),
+        "gate_entropy":      norm_entropy.mean().item(),
+        "pos_sim":           pos_sim_mean.item(),
+        "neg_sim_top10":     top_neg_sim.item(),
+        "pos_neg_gap":       (pos_sim_mean - top_neg_sim).item(),
+        "n_active":          n_active.item(),
+        "n_cutoff":          n_cutoff.item(),
+        "hard_easy_ratio":   hard_easy_ratio.item(),
+        "effective_k":       eff_k.item(),
+        "theta_value":       float(theta) if theta is not None else 0.0,
     }
 
 
@@ -253,6 +305,12 @@ def build_loss(args) -> nn.Module:
     if args.task == "infonce":
         if args.loss == "sm":
             return SoftmaxInfoNCE(tau=args.tau)
+        if args.loss == "sqjr":
+            return SqJumpReLUInfoNCE(
+                tau=args.tau,
+                theta_init=args.sqjr_theta_init,
+                learnable=args.sqjr_theta_learnable,
+            )
         return SoftplusmaxInfoNCE(tau=args.tau)
     raise ValueError(args.task)
 
@@ -499,17 +557,29 @@ def train_infonce(args):
         elapsed = time.time() - t0
         cur_lr = opt.param_groups[0]["lr"]
 
+        # Pull current theta from the loss module if it has one (SqJumpReLU).
+        cur_theta = None
+        if hasattr(loss_fn, "theta"):
+            t = loss_fn.theta
+            cur_theta = t.item() if hasattr(t, "item") else float(t)
+
         diag = infonce_diagnostics(
             last_za, last_zb,
             loss_kind=args.loss,
-            tau=(args.tau if args.loss == "sm" else None),
+            tau=args.tau,
+            theta=cur_theta,
         ) if last_za is not None else {}
 
         log_dict = dict(epoch=epoch, lr=cur_lr, train_loss=train_loss,
-                        time=elapsed, grad_norm=avg_gn, **diag)
+                        time=elapsed, grad_norm=avg_gn,
+                        theta=cur_theta if cur_theta is not None else 0.0,
+                        **diag)
+        theta_str = f"  θ={cur_theta:.3f}" if cur_theta is not None else ""
         print(f"ep {epoch:3d}  lr={cur_lr:.4f}  loss={train_loss:.4f}  "
               f"pos_g={diag.get('pos_gate_share',0):.4f}  "
               f"H={diag.get('gate_entropy',0):.3f}  "
+              f"hard/easy={diag.get('hard_easy_ratio',0):.2f}  "
+              f"n_cut={diag.get('n_cutoff',0):.1f}{theta_str}  "
               f"gn={avg_gn:.2f}  time={elapsed:.1f}s")
         with open(args.out_dir / "history.jsonl", "a") as f:
             f.write(json.dumps(log_dict) + "\n")
@@ -529,7 +599,7 @@ def train_infonce(args):
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--task", choices=["cls", "kd", "infonce"], required=True)
-    p.add_argument("--loss", choices=["sm", "sp"], required=True)
+    p.add_argument("--loss", choices=["sm", "sp", "sqjr"], required=True)
     p.add_argument("--data", default="./data")
     p.add_argument("--out_dir", default=None,
                    help="Default: runs/<task>_<loss>[_T#|_tau#]/")
@@ -553,8 +623,14 @@ def get_args():
     p.add_argument("--teacher_ckpt", default=None)
 
     # infonce: SimCLR CIFAR-100 standard τ=0.5 (Chen et al. 2020 Appendix B,
-    # vs τ=0.1 used for ImageNet). Softplusmax has no τ — flag is ignored.
+    # vs τ=0.1 used for ImageNet).
     p.add_argument("--tau", type=float, default=0.5)
+    # SqJumpReLU specific.
+    p.add_argument("--sqjr_theta_init", type=float, default=0.0,
+                   help="Initial θ for Squared JumpReLU normalization.")
+    p.add_argument("--sqjr_theta_learnable",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="If true, θ is learned via SGD (no STE needed).")
 
     # wandb
     p.add_argument("--wandb", action="store_true",
@@ -584,6 +660,9 @@ def main():
             suffix = f"_T{args.T:g}"
         if args.task == "infonce":
             suffix = f"_tau{args.tau:g}"
+            if args.loss == "sqjr":
+                lr = "L" if args.sqjr_theta_learnable else "F"
+                suffix += f"_th{args.sqjr_theta_init:g}{lr}"
         args.out_dir = f"runs/{args.task}_{args.loss}{suffix}"
     args.out_dir = Path(args.out_dir)
     args.out_dir.mkdir(parents=True, exist_ok=True)
